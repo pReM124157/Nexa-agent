@@ -954,7 +954,7 @@ const handleMessage = async (message) => {
 };
 
 client.on("message", (msg) => {
-  if (!msg.fromMe) handleMessage(msg);
+  handleMessage(msg);
 });
 client.on("message_create", (msg) => {
   // ONLY process self-chat mentions
