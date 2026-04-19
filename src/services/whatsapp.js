@@ -546,7 +546,8 @@ client.on("remote_session_saved", () => {
 });
 
 client.on("ready", () => {
-  console.log("Nexa is ready ✅");
+  console.log("✅ Nexa is ready ✅");
+  global.isReady = true;
   console.log("✅ Session restored:", client.info ? "YES" : "NO");
 
   if (!schedulerStarted) {
