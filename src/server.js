@@ -1,3 +1,19 @@
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 require("dotenv").config();
 console.log("SERPER_API_KEY:", process.env.SERPER_API_KEY ? "FOUND" : "MISSING");
 const express = require("express");
@@ -12,8 +28,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5050;
 
-// Initialize WhatsApp client
-whatsappClient.initialize();
+// WhatsApp client will be initialized after the server is listening
 
 // Root route
 app.get("/", (req, res) => {
@@ -54,6 +69,9 @@ app.get('/qr', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`OpenClaw running on port ${PORT}`);
+
+  // Start WhatsApp AFTER server is listening
+  whatsappClient.initialize();
 
   // GitHub Test
   getRepos().then((repos) => {
