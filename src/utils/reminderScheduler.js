@@ -3,17 +3,31 @@ const path = require("path");
 
 const filePath = path.join(__dirname, "../../data/reminders.json");
 
+// Ensure file exists
+function ensureFile() {
+  if (!fs.existsSync(filePath)) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify([]));
+  }
+}
+
+// Safe read
+function getReminders() {
+  ensureFile();
+  try {
+    const data = fs.readFileSync(filePath, "utf-8");
+    return JSON.parse(data || "[]");
+  } catch (err) {
+    console.error("Error reading reminders:", err);
+    return [];
+  }
+}
+
 function startReminderScheduler(client) {
 
   setInterval(async () => {
     try {
-      let reminders = [];
-
-      const raw = fs.readFileSync(filePath, "utf-8").trim();
-
-      if (raw) {
-        reminders = JSON.parse(raw);
-      }
+      const reminders = getReminders();
 
       const now = new Date();
 
