@@ -502,9 +502,7 @@ async function initialize() {
         dataPath: "/tmp/.wwebjs_auth"
       }),
       puppeteer: {
-        executablePath:
-          process.env.PUPPETEER_EXECUTABLE_PATH ||
-          '/opt/render/.cache/puppeteer/chrome/linux-146.0.7680.153/chrome-linux64/chrome',
+        executablePath: '/usr/bin/chromium',
         headless: true,
         args: [
           "--no-sandbox",
