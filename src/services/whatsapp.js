@@ -518,9 +518,17 @@ async function initialize() {
 
 let schedulerStarted = false;
 
+global.lastQR = null;
+
 client.on("qr", (qr) => {
   console.log("\nScan this QR with WhatsApp:\n");
   qrcode.generate(qr, { small: true });
+  
+  // Convert to image URL for /qr endpoint
+  const QRCode = require('qrcode');
+  QRCode.toDataURL(qr, (err, url) => {
+    if (!err) global.lastQR = url;
+  });
 });
 
 client.on("remote_session_saved", () => {

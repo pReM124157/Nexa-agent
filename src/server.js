@@ -37,6 +37,21 @@ app.get("/status", (req, res) => {
   });
 });
 
+// QR endpoint for easier scanning
+app.get('/qr', (req, res) => {
+  if (!global.lastQR) {
+    return res.send('<h2>No QR yet. Refresh in 30 seconds.</h2>');
+  }
+  res.send(`
+    <html>
+      <head><title>Nexa QR</title></head>
+      <body style="background:#000;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+        <img src="${global.lastQR}" style="width:300px;background:#fff;padding:10px;border-radius:8px"/>
+      </body>
+    </html>
+  `);
+});
+
 app.listen(PORT, "127.0.0.1", () => {
   console.log(`OpenClaw running on http://127.0.0.1:${PORT}`);
 
