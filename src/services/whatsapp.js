@@ -591,8 +591,6 @@ const handleMessage = async (message) => {
     console.log(`[Incoming] From: ${message.from} | Body: ${rawBody.slice(0, 50)}`);
 
     const chatId = message.from;
-    const isOwner = message.fromMe;
-    const isMention = text.includes("@nexa");
 
     // STEP 2: Logic Gating
     // 2a: Owner must mention @nexa to avoid self-reply loops
