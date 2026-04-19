@@ -557,6 +557,14 @@ client.on("ready", () => {
   }
 });
 
+client.on("change_state", (state) => {
+  console.log("📡 Connection state changed:", state);
+});
+
+client.on("disconnected", (reason) => {
+  console.log("❌ Client disconnected:", reason);
+});
+
 client.on("authenticated", () => {
   console.log("✅ AUTHENTICATED — session loaded from MongoDB");
 });
