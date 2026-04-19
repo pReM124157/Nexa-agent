@@ -494,11 +494,6 @@ async function initialize() {
     // NOW create store (safe)
     const store = new MongoStore({ mongoose });
 
-    const chromePath = process.env.PUPPETEER_EXECUTABLE_PATH ||
-      '/opt/render/.cache/puppeteer/chrome/linux-146.0.7680.153/chrome-linux64/chrome';
-
-    console.log("Chrome path:", chromePath);
-
     client = new Client({
       authStrategy: new RemoteAuth({
         store,
@@ -507,7 +502,6 @@ async function initialize() {
         dataPath: "/tmp/.wwebjs_auth"
       }),
       puppeteer: {
-        executablePath: chromePath,
         headless: true,
         args: [
           "--no-sandbox",
