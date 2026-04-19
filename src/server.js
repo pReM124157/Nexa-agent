@@ -40,20 +40,20 @@ app.get("/status", (req, res) => {
 // QR endpoint for easier scanning
 app.get('/qr', (req, res) => {
   if (!global.lastQR) {
-    return res.send('<h2>No QR yet. Refresh in 30 seconds.</h2>');
+    return res.send('<h2 style="color:white;background:black;padding:20px">No QR yet. Wait 30 seconds and refresh.</h2>');
   }
   res.send(`
     <html>
-      <head><title>Nexa QR</title></head>
-      <body style="background:#000;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-        <img src="${global.lastQR}" style="width:300px;background:#fff;padding:10px;border-radius:8px"/>
+      <body style="background:#000;display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;margin:0">
+        <h2 style="color:white;font-family:sans-serif">Scan with WhatsApp</h2>
+        <img src="${global.lastQR}" style="width:300px;height:300px"/>
       </body>
     </html>
   `);
 });
 
-app.listen(PORT, "127.0.0.1", () => {
-  console.log(`OpenClaw running on http://127.0.0.1:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`OpenClaw running on port ${PORT}`);
 
   // GitHub Test
   getRepos().then((repos) => {
