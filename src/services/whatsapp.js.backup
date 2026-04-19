@@ -1,0 +1,861 @@
+const { Client, LocalAuth } = require("whatsapp-web.js");
+const qrcode = require("qrcode-terminal");
+
+
+const { startReminderScheduler } = require("../utils/reminderScheduler");
+const { askLLM, planTasks } = require("./llmService");
+const { getRepos, getRepoFiles } = require("./githubService");
+const { sendPushoverAlert } = require("./notificationService");
+const fs = require("fs");
+const path = require("path");
+const pdfParse = require("pdf-parse");
+const Tesseract = require("tesseract.js");
+const sharp = require("sharp");
+const { exec } = require("child_process");
+const { addMessageToMemory, getChatContext, pushToStack, popFromStack, updateChatMetadata, getChatMetadata } = require("../utils/chatMemory");
+
+const HIGH_RISK_ACTIONS = ["send_message", "send_file"];
+
+// Ensure temp directory exists
+const TEMP_DIR = path.join(__dirname, "../../temp");
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+const AUTO_REPLY_STATE_PATH = path.join(__dirname, "../../data/auto_reply_state.json");
+const SIX_HOURS = 6 * 60 * 60 * 1000;
+const COMMAND_NUMBER = "919321762299";
+const SELF_CHAT = "919321762299@c.us";
+const CONTACTS_PATH = path.join(__dirname, "../../data/contacts.json");
+console.log("CONTACT FILE PATH:", CONTACTS_PATH);
+const CHAT_MEMORY_PATH = path.join(__dirname, "../../data/chat_memory.json");
+const PDF_MEMORY_PATH = path.join(__dirname, "../../data/pdf_memory.json");
+const PRIORITY_CONTACTS_PATH = path.join(__dirname, "../../data/priority_contacts.json");
+const MAX_HISTORY = 20;
+
+const sensitiveCategories = [
+  "phone number",
+  "saved contacts",
+  "contact names",
+  "family names",
+  "stored memories",
+  "chat history",
+  "recent messages",
+  "who prem is talking to",
+  "who prem messaged",
+  "who messaged prem",
+  "github tokens",
+  "api keys",
+  "environment variables",
+  "personal notes",
+  "project secrets",
+  "location",
+  "live location",
+  "home address",
+  "office address",
+  "financial details",
+  "bank details",
+  "income",
+  "card details",
+  "private schedule",
+  "private reminders",
+  "passwords",
+  "access tokens"
+];
+
+function containsSensitiveRequest(text) {
+  const lower = text.toLowerCase();
+  return sensitiveCategories.some(item => lower.includes(item));
+}
+
+function normalizeNumber(input) {
+  if (!input) return null;
+  // Remove all non-digit characters (spaces, +, -, etc.)
+  let num = input.replace(/\D/g, "");
+
+  // If it starts with 91 and is 12 digits, it's already normalized
+  if (num.startsWith("91") && num.length === 12) {
+    return num;
+  }
+
+  // If it's a 10-digit number, prepend 91
+  if (num.length === 10 && /^[6-9]/.test(num)) {
+    return "91" + num;
+  }
+
+  return null;
+}
+
+function isValidPhone(number) {
+  // We use normalizeNumber now, so this is just a final check
+  const normalized = normalizeNumber(number);
+  return normalized !== null;
+}
+
+function normalize(name) {
+  return name.toLowerCase().trim();
+}
+
+function resolveContactName(input, contacts) {
+  if (!input) return null;
+  const name = normalize(input);
+
+  // 1. Exact match
+  if (contacts[name]) return name;
+
+  // 2. Partial match (e.g., "ja" matches "jainam" or "jainam bhai" matches "jainam")
+  const match = Object.keys(contacts).find(k => 
+    k.includes(name) || name.includes(k)
+  );
+
+  return match || null;
+}
+
+function getContacts() {
+  try {
+    if (fs.existsSync(CONTACTS_PATH)) {
+      const contacts = JSON.parse(fs.readFileSync(CONTACTS_PATH, "utf-8"));
+      // Migration/Normalization: Ensure all keys are lowercase
+      const normalizedContacts = {};
+      for (const [key, value] of Object.entries(contacts)) {
+        normalizedContacts[key.toLowerCase().trim()] = value;
+      }
+      return normalizedContacts;
+    }
+  } catch (err) {
+    console.error("Error reading contacts:", err);
+  }
+  return {};
+}
+
+function saveContact(name, number) {
+  try {
+    const contacts = getContacts();
+    const cleanName = normalize(name);
+    const cleanNumber = normalizeNumber(number);
+    
+    if (!cleanNumber) {
+      return false;
+    }
+
+    // 🔥 ALWAYS OVERWRITE (Allows updates and enforces normalization)
+    contacts[cleanName] = cleanNumber;
+    fs.writeFileSync(CONTACTS_PATH, JSON.stringify(contacts, null, 2));
+    
+    console.log("SUCCESSFULLY SAVED:", cleanName, cleanNumber);
+    return cleanName;
+  } catch (err) {
+    console.error("Error saving contact:", err);
+    return false;
+  }
+}
+
+function getAutoReplyState() {
+  try {
+    if (fs.existsSync(AUTO_REPLY_STATE_PATH)) {
+      return JSON.parse(fs.readFileSync(AUTO_REPLY_STATE_PATH, "utf-8"));
+    }
+  } catch (err) {
+    console.error("Error reading auto-reply state:", err);
+  }
+  return {};
+}
+
+function saveAutoReplyState(state) {
+  try {
+    fs.writeFileSync(AUTO_REPLY_STATE_PATH, JSON.stringify(state, null, 2));
+  } catch (err) {
+    console.error("Error saving auto-reply state:", err);
+  }
+}
+
+function getPDFMemory(chatId) {
+  try {
+    if (fs.existsSync(PDF_MEMORY_PATH)) {
+      const memory = JSON.parse(fs.readFileSync(PDF_MEMORY_PATH, "utf-8"));
+      return memory[chatId] || null;
+    }
+  } catch (err) {
+    console.error("Error reading PDF memory:", err);
+  }
+  return null;
+}
+
+function savePDFMemory(chatId, text) {
+  try {
+    let memory = {};
+    if (fs.existsSync(PDF_MEMORY_PATH)) {
+      const raw = fs.readFileSync(PDF_MEMORY_PATH, "utf-8");
+      memory = raw ? JSON.parse(raw) : {};
+    }
+    memory[chatId] = text;
+    fs.writeFileSync(PDF_MEMORY_PATH, JSON.stringify(memory, null, 2));
+  } catch (err) {
+    console.error("Error saving PDF memory:", err);
+  }
+}
+
+async function extractPDFText(filePath) {
+  const buffer = fs.readFileSync(filePath);
+
+  // STEP 1: Try Text-based extraction (Fast/Primary)
+  try {
+    const data = await pdfParse(buffer);
+    if (data.text && data.text.trim().length > 100) {
+      console.log("✅ [PDF] Text-based extraction successful.");
+      return data.text.trim();
+    }
+  } catch (e) {
+    console.log("[-] pdf-parse failed, falling back to OCR...");
+  }
+
+  // STEP 2: OCR Fallback (Multi-page)
+  console.log("🧠 [PDF] Starting multi-page OCR conversion...");
+  
+  const prefix = path.join(TEMP_DIR, `page_${Date.now()}`);
+  
+  try {
+    // Convert PDF → images (pdftoppm)
+    await runCommand(`pdftoppm -png "${filePath}" "${prefix}"`);
+
+    // Get all generated page images
+    const files = fs.readdirSync(TEMP_DIR)
+      .filter(f => f.startsWith(path.basename(prefix)) && f.endsWith(".png"))
+      .sort();
+
+    if (files.length === 0) {
+      throw new Error("No images generated from PDF");
+    }
+
+    // 🔥 Safety Limit: Max 5 pages for OCR
+    const processingFiles = files.slice(0, 5);
+    console.log(`[OCR] Processing ${processingFiles.length} pages (Limit: 5).`);
+
+    let fullText = "";
+
+    // OCR Each Page sequentially
+    for (const file of processingFiles) {
+      const imgPath = path.join(TEMP_DIR, file);
+      console.log(`[OCR] Reading page: ${file}`);
+      
+      const { data: { text } } = await Tesseract.recognize(
+        imgPath,
+        "eng",
+        { logger: m => {
+          if (m.status === "recognizing text" && Math.round(m.progress * 100) % 50 === 0) {
+            console.log(`[OCR] ${file} progress: ${Math.round(m.progress * 100)}%`);
+          }
+        }}
+      );
+      
+      fullText += text + "\n";
+      
+      // Cleanup image immediately
+      if (fs.existsSync(imgPath)) {
+        fs.unlinkSync(imgPath);
+      }
+    }
+
+    // Cleanup any remaining pages above the limit
+    files.forEach(f => {
+      const p = path.join(TEMP_DIR, f);
+      if (fs.existsSync(p)) {
+        try { fs.unlinkSync(p); } catch {}
+      }
+    });
+
+    return fullText.trim();
+  } catch (ocrErr) {
+    console.error("OCR Pipeline Failed:", ocrErr);
+    return null;
+  }
+}
+
+function runCommand(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) return reject(err);
+      resolve(stdout);
+    });
+  });
+}
+
+function getPriorityContacts() {
+  try {
+    if (fs.existsSync(PRIORITY_CONTACTS_PATH)) {
+      return JSON.parse(fs.readFileSync(PRIORITY_CONTACTS_PATH, "utf-8"));
+    }
+  } catch (err) {
+    console.error("Error reading priority contacts:", err);
+  }
+  return {};
+}
+
+const URGENT_KEYWORDS = [
+  "urgent",
+  "asap",
+  "call now",
+  "emergency",
+  "important",
+  "immediately",
+  "right now",
+  "please call",
+  "need help",
+  "critical"
+];
+
+function classifyMessage(text, sender, priorityContacts) {
+  const lower = text.toLowerCase();
+  const isUrgent = URGENT_KEYWORDS.some(keyword => lower.includes(keyword));
+  const isPrioritySender = Object.values(priorityContacts).includes(sender);
+
+  if (isUrgent) return "urgent";
+  if (isPrioritySender) return "high";
+  return "normal";
+}
+
+// LEGACY HISTORY REMOVED - Using chatMemory.js
+
+/**
+ * Strips context-leaking phrases to maintain agentic silence.
+ */
+function sanitizeNexaResponse(text) {
+  if (!text) return text;
+  return text
+    .replace(/(as|per|like)\s+(you|we)\s+(mentioned|said|discussed)(.*?)(earlier|previously|before)\s*/gi, "")
+    .replace(/you\s+asked\s+(me\s+)?to\s+(.*?)\s+earlier\s*/gi, "")
+    .replace(/based\s+on\s+our\s+previous\s+conversation\s*/gi, "")
+    .replace(/mentioned\s+previously\s*/gi, "")
+    .trim();
+}
+
+/**
+ * Validates if a string part contains a legitimate command intent.
+ */
+function isValidIntent(part) {
+  const p = part.toLowerCase();
+  return /\b(send|tell|say|message|ask|save|summarize|read|analyze|undo|rollback)\b/.test(p);
+}
+
+/**
+ * Splits text into safe chunks without breaking sentences like "eat and sleep".
+ */
+function controlledSplitter(text) {
+  if (!text) return [];
+  // Split by "and then", "then", or newline
+  const parts = text.split(/\b(?:and then|then)\b|\n/i);
+  return parts.map(p => p.trim()).filter(p => p.length > 0 && isValidIntent(p));
+}
+
+/**
+ * Resolves pronouns in v3 (Confidence-aware).
+ */
+function resolvePronounV3(chatId, input, type) {
+  const metadata = getChatMetadata(chatId);
+  const val = (input || "").toLowerCase();
+
+  if (type === "recipient") {
+    const stack = metadata.recentRecipients || [];
+    if (["them", "him", "her", "that person", "this person"].includes(val)) {
+      return { value: stack.at(-1), confidence: 0.7 }; // Stack match
+    }
+    if (val.includes("previous")) {
+      return { value: stack.at(-2), confidence: 0.8 }; // Explicit stack match
+    }
+  }
+
+  if (type === "document") {
+    const stack = metadata.recentDocuments || [];
+    if (["it", "that", "the file", "the document"].includes(val)) {
+      return { value: stack.at(-1), confidence: 0.7 }; // Stack match
+    }
+    if (val.includes("previous")) {
+      return { value: stack.at(-2), confidence: 0.8 }; // Explicit stack match
+    }
+  }
+
+  return { value: null, confidence: 0 };
+}
+
+/**
+ * Sanitizes step types using hard keyword rules to prevent LLM misclassification.
+ */
+function normalizeStepType(step) {
+  const text = (step.content || step.recipient || "").toLowerCase();
+  const type = (step.type || "").toLowerCase();
+
+  if (text.includes("summarize") || text.includes("summary") || text.includes("analyze")) {
+    return "summarize_pdf";
+  }
+  if (type === "send_file" || type === "send_message") {
+    return type;
+  }
+  return type;
+}
+
+/**
+ * Normalizes a single step from the planner (Stack/Name resolution).
+ */
+function normalizeStep(step, chatId, contacts) {
+  const out = { ...step };
+  out.type = normalizeStepType(step);
+  
+  let recipientConf = out.recipient ? (resolveContactName(out.recipient, contacts) ? 1.0 : 0.4) : 0;
+  let docConf = step.type === "send_file" ? 0.5 : 1.0;
+
+  // Resolve Recipient
+  const resRecipient = resolvePronounV3(chatId, step.recipient, "recipient");
+  if (resRecipient.value && resRecipient.confidence > recipientConf) {
+    out.recipient = resRecipient.value.name || resRecipient.value;
+    recipientConf = resRecipient.confidence;
+    out.usesMemory = true;
+  }
+  out.finalRecipient = resolveContactName(out.recipient, contacts);
+
+  // Resolve File
+  if (step.type === "send_file" || step.type === "summarize_pdf") {
+    const resDoc = resolvePronounV3(chatId, step.fileRef || "it", "document");
+    if (resDoc.value) {
+      out.fileMeta = resDoc.value;
+      docConf = resDoc.confidence;
+      out.usesMemory = true;
+    } else {
+      docConf = 0; // Explicit fail if missing
+    }
+  }
+
+  out.confidence = Math.min(recipientConf, docConf);
+  return out;
+}
+
+
+
+const ALLOWED_NUMBERS = [
+  "919321762299", // you
+  "919870781079", // mummy
+  "917738266248", // deep chaudhari
+  "919321790199", // arya vs
+  "919136681300"  // arya vs (new)
+];
+
+
+const client = new Client({
+  authStrategy: new LocalAuth({
+    clientId: "openclaw-personal"
+  }),
+  puppeteer: {
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage"
+    ]
+  }
+});
+
+let schedulerStarted = false;
+
+client.on("qr", (qr) => {
+  console.log("\nScan this QR with WhatsApp:\n");
+  qrcode.generate(qr, { small: true });
+});
+
+client.on("authenticated", () => {
+  console.log("WhatsApp authenticated");
+});
+
+client.on("ready", () => {
+  console.log("WhatsApp connected successfully");
+
+  if (!schedulerStarted) {
+    startReminderScheduler(client);
+    schedulerStarted = true;
+    console.log("Reminder scheduler started");
+  }
+});
+
+client.on("auth_failure", (msg) => {
+  console.error("Auth failure:", msg);
+});
+
+client.on("message_create", async (message) => {
+  try {
+    const rawBody = (message.body || "").trim();
+    const text = rawBody.toLowerCase();
+    const isOwner = message.fromMe;
+    const chatId = message.from;
+
+    // Ignore non-user messages
+    if (!message.from.endsWith("@c.us")) return;
+
+    // 📄 PASSIVE MEDIA CAPTURE: Detect PDFs in current or quoted message
+    let mediaMsg = message.hasMedia ? message : null;
+    if (!mediaMsg) {
+       const quoted = await message.getQuotedMessage().catch(() => null);
+       if (quoted && quoted.hasMedia) mediaMsg = quoted;
+    }
+
+    if (mediaMsg && isOwner) {
+       const media = await mediaMsg.downloadMedia().catch(() => null);
+       if (media && media.mimetype.includes("pdf")) {
+          console.log("[PASSIVE] PDF detected. Storing in memory...");
+          const tempPath = path.join(TEMP_DIR, `passive_${Date.now()}.pdf`);
+          fs.writeFileSync(tempPath, Buffer.from(media.data, "base64"));
+          const text = await extractPDFText(tempPath).catch(() => "");
+          if (text) {
+             pushToStack(chatId, "recentDocuments", {
+                content: text,
+                name: media.filename || "document",
+                type: "pdf",
+                data: media.data,
+                mimetype: media.mimetype
+             });
+             console.log(`[PASSIVE] Document stored (${text.length} chars).`);
+          }
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+       }
+    }
+
+    console.log("RAW:", message.body);
+
+    // 🧠 RECORD USER MESSAGE IN ROLLING MEMORY
+    addMessageToMemory(chatId, "user", rawBody);
+    
+    // 🛡️ BORDER AGENT: Check for pending action/plan confirmations
+    const metadata = getChatMetadata(chatId);
+    const isConfirmationReply = /^(yes|no|confirm|cancel|y|n|do it)$/i.test(text);
+
+    if (isOwner && metadata.pendingAction) {
+       const isExpired = Date.now() - metadata.pendingAction.createdAt > 60000;
+       if (isExpired) {
+          updateChatMetadata(chatId, { pendingAction: null });
+       } else if (isConfirmationReply) {
+          const reply = text.toLowerCase();
+          if (reply === "yes" || reply === "confirm" || reply === "y" || reply === "do it") {
+            const currentPlan = metadata.pendingAction.plan || [metadata.pendingAction.data];
+            updateChatMetadata(chatId, { pendingAction: null });
+            await processPlan(chatId, currentPlan, message);
+            return;
+          } else if (reply === "no" || reply === "cancel" || reply === "n") {
+            updateChatMetadata(chatId, { pendingAction: null });
+            await message.reply("Action cancelled. 🛑");
+            return;
+          }
+       } else if (isTaskIntent(text)) {
+          // If a new command comes in, clear the old pending action silently
+          updateChatMetadata(chatId, { pendingAction: null });
+       }
+    }
+    
+    // Clean text for processing
+    const isSelfChat = isOwner && (message.to === message.from || message.id.remote === message.from);
+
+    // 🛡️ FULL PERSONAL DATA PRIVACY FIREWALL
+    // Immediately block sensitive queries from anyone except the owner
+    if (!isOwner && containsSensitiveRequest(rawBody)) {
+      console.log(`[FIREWALL] Blocked sensitive query from: ${message.from}`);
+      await message.reply("I’m unable to share any private or personal information.");
+      return;
+    }
+
+    // 🤖 IGNORE BOT-GENERATED REPLIES TO PREVENT LOOPS
+    if (isOwner && !isSelfChat && !text.includes("@nexa") && !text.includes("remind")) {
+      return;
+    }
+
+    // 🧠 GET SENDER INFO
+    let contact;
+    let senderNumber;
+    try {
+      contact = await message.getContact();
+      senderNumber = contact.number;
+    } catch (err) {
+      senderNumber = (message.author || message.from || "").split("@")[0];
+    }
+
+    // 🔄 AUTO-REPLY STATE CHECK
+    const autoReplyState = getAutoReplyState();
+    const autoReplyTimestamp = autoReplyState[chatId] || autoReplyState[senderNumber];
+    const isAutoReplyActive = autoReplyTimestamp && (Date.now() - autoReplyTimestamp < SIX_HOURS);
+
+    // ⚙️ OWNER COMMAND: TOGGLE AUTO-REPLY
+    if (isOwner && text.includes("@nexa") && text.includes("auto-reply")) {
+       const match = text.match(/auto-reply (on|off)( for (.+))?/i);
+       if (match) {
+          const action = match[1].toLowerCase();
+          const targetName = match[3];
+          let targetId = chatId;
+          
+          if (targetName) {
+             const contacts = getContacts();
+             const resolvedName = resolveContactName(targetName, contacts);
+             if (resolvedName && contacts[resolvedName]) {
+                targetId = `${contacts[resolvedName]}@c.us`;
+             } else {
+                return await message.reply(`Unknown contact: ${targetName}. Please check your contact list.`);
+             }
+          }
+
+          if (action === "on") {
+             autoReplyState[targetId] = Date.now();
+             saveAutoReplyState(autoReplyState);
+             return await message.reply(`✅ Auto-reply enabled for ${targetName || "this chat"} for the next 6 hours.`);
+          } else {
+             delete autoReplyState[targetId];
+             saveAutoReplyState(autoReplyState);
+             return await message.reply(`🛑 Auto-reply disabled for ${targetName || "this chat"}.`);
+          }
+       }
+    }
+
+    // Only process if it mentions @nexa OR auto-reply is active
+    if (!text.includes("@nexa") && !isAutoReplyActive) {
+      return;
+    }
+
+    // Clean text for processing
+    const cleanText = rawBody.replace(/@nexa/gi, "").trim();
+    const cleanTextLower = cleanText.toLowerCase();
+
+    // 🚀 STEP 1: DETECT TASK COMMAND INTENT
+    const isUndoTrigger = cleanTextLower === "undo" || cleanTextLower === "rollback";
+    const isTaskIntentTrigger = isUndoTrigger || /^(send|tell|say|message|ask|save|summarize|read|analyze)\b/i.test(cleanTextLower) || /\b(send|tell|say|message|ask|save|summarize|read|analyze)\b.*\b(to|me|this|that|last|previous)\b/i.test(cleanTextLower);
+    
+    // Simple Question Check: If it's short and looks like a question, bypass planner
+    const isSimpleQuestion = cleanTextLower.length < 30 && (cleanTextLower.includes("?") || /^(are|is|how|who|what|where|why|can)\b/i.test(cleanTextLower));
+
+    if (isOwner && isTaskIntentTrigger && !isSimpleQuestion) {
+      if (isUndoTrigger) {
+         await message.reply("Rolling back last action... ⏳");
+         await handleUndo(chatId, message);
+         return;
+      }
+
+      // Immediate Feedback
+      await message.react("⏳");
+      const statusMsg = await message.reply("Got your request — working on it. 🚀");
+
+      // HIGH PERFORMANCE BYPASS: Direct summarization
+      if ((cleanTextLower.includes("summarize") || cleanTextLower.includes("summary")) && !cleanTextLower.includes("and")) {
+         console.log("[V4 BYPASS] Direct summarization triggered.");
+         await processPlan(chatId, [{ type: "summarize_pdf", fileRef: "it" }], message, statusMsg);
+         return; 
+      }
+
+      console.log(`[V4 PLANNER] Generating plan for: "${cleanText}"`);
+      const context = getChatContext(chatId).map(m => `${m.role}: ${m.content}`).join("\n");
+      const planRes = await planTasks(cleanText, context);
+      
+      if (!planRes.steps || planRes.steps.length === 0) {
+        await statusMsg.edit("I'm not sure how to plan that. Could you be more specific? 🛑");
+        return;
+      }
+
+      if (planRes.steps.length > 5) {
+        await statusMsg.edit("Too many tasks. Please break them down. 🛑");
+        return;
+      }
+
+      await statusMsg.edit("Plan generated. Executing... ⚙️");
+      await processPlan(chatId, planRes.steps, message, statusMsg);
+      return;
+    }
+
+    // 🚀 STEP 2: GENERAL CONVERSATION (Fallback)
+    // Check permission for general chat
+
+    const localContacts = getContacts();
+    const isContact = Object.values(localContacts).includes(senderNumber);
+
+    if (!ALLOWED_NUMBERS.includes(senderNumber) && !isContact) {
+      console.log(`Unauthorized chat ignored: ${senderNumber}`);
+      return;
+    }
+
+    const history = getChatContext(chatId);
+    let systemContext = "";
+    if (text.match(/\b(repo|repository)\b/)) {
+      const { getRepos } = require("./githubService"); // Lazy load
+      const repos = await getRepos();
+      systemContext = `User's repos: ${repos.map(r => r.name).join(", ")}. `;
+    }
+
+    const aiReply = await askLLM(cleanText, systemContext, history);
+    const sanitizedReply = sanitizeNexaResponse(aiReply);
+    addMessageToMemory(chatId, "assistant", sanitizedReply);
+
+    await message.reply(sanitizedReply);
+
+  } catch (error) {
+    console.error("FATAL MESSAGE ERROR:", error);
+  }
+});
+
+/**
+ * Helper to identify task intents.
+ */
+function isTaskIntent(text) {
+  return /send|tell|say|message|ask|save|summarize|read|analyze|undo|rollback/i.test(text);
+}
+
+/**
+ * THE ORCHESTRATOR (v4 logic)
+ * Sequential multi-step execution with deterministic reporting.
+ */
+async function processPlan(chatId, steps, message, statusMsg = null) {
+  const contacts = getContacts();
+  const results = [];
+  const totalSteps = steps.length;
+
+  for (let i = 0; i < totalSteps; i++) {
+    const rawStep = steps[i];
+    const step = normalizeStep(rawStep, chatId, contacts);
+
+    // 1. DEDUPLICATION
+    if (isDuplicateAction(chatId, step)) {
+      results.push(`Step ${i+1}: Already sent 🛑`);
+      continue;
+    }
+
+    // 2. SAFETY GATE: GATING, VALIDATION & CONFIRMATION
+    const isHighRisk = HIGH_RISK_ACTIONS.includes(step.type);
+    
+    // VALIDATION: Catch missing resources before confirmation
+    if (step.type === "summarize_pdf" && !step.fileMeta) {
+      results.push(`Step ${i+1}: No PDF in memory ❌`);
+      const errorText = "I don't see any recent PDF to summarize. Please send or reply to a document. 🛑";
+      if (statusMsg) await statusMsg.edit(errorText); else await message.reply(errorText);
+      break;
+    }
+    if (isHighRisk && !step.finalRecipient) {
+      results.push(`Step ${i+1}: Missing recipient ❌`);
+      const errorText = `I'm not sure who to send this to. Could you clarify? 🛑`;
+      if (statusMsg) await statusMsg.edit(errorText); else await message.reply(errorText);
+      break;
+    }
+
+    // GATING: Only confirm HIGH_RISK or very low confidence actions
+    // SAFE actions (summarize) always auto-execute if resource exists
+    const needsConfirmation = isHighRisk && (step.usesMemory || step.confidence < 0.9);
+    
+    if (needsConfirmation) {
+       // Stop and ask for confirmation
+       const remaining = steps.slice(i);
+       updateChatMetadata(chatId, {
+          pendingAction: { plan: remaining, createdAt: Date.now() }
+       });
+       const preview = `Confirm: ${step.type.replace("_", " ")} to ${step.finalRecipient || step.recipient}? (yes/no)`;
+       const confirmText = `Plan Progress:\n${results.join("\n") || ""}\n⏳ ${preview}`;
+       if (statusMsg) await statusMsg.edit(confirmText); else await message.reply(confirmText);
+       return;
+    }
+
+    // 3. EXECUTE
+    try {
+      const success = await executeStep(step, message, statusMsg);
+      if (success) {
+        results.push(`Step ${i+1}: ${step.type.replace("_", " ")} ✅`);
+      } else {
+        results.push(`Step ${i+1}: Failed ❌`);
+        break; // Stop plan on failure
+      }
+    } catch (e) {
+      console.error("Exec error:", e);
+      results.push(`Step ${i+1}: Error ❌`);
+      break; 
+    }
+  }
+
+  // Final Reporting: ALWAYS report status for task intents to close the loop
+  const finalReport = `Task Status:\n${results.join("\n")}`;
+  if (statusMsg) {
+    await statusMsg.edit(`✅ Done!\n\n${finalReport}`);
+  } else {
+    await message.reply(finalReport);
+  }
+}
+
+/**
+ * Checks if the exact action was performed in the last 30s.
+ */
+function isDuplicateAction(chatId, step) {
+  const meta = getChatMetadata(chatId);
+  const stack = meta.actionStack || [];
+  if (stack.length === 0) return false;
+  const last = stack.at(-1);
+  const now = Date.now();
+  
+  return (now - last.timestamp < 30000) && 
+         last.type === step.type && 
+         last.targetName === step.finalRecipient && 
+         last.content === step.content;
+}
+
+/**
+ * Individual action executor for v4 steps.
+ */
+async function executeStep(step, message, statusMsg = null) {
+  const chatId = message.from;
+  const contacts = getContacts();
+  
+  if (step.type === "send_message" || step.type === "send_file") {
+    const number = contacts[normalize(step.finalRecipient || step.recipient)];
+    if (!number) throw new Error("Contact not found");
+    const targetChatId = `${number}@c.us`;
+
+    if (step.type === "send_file") {
+       const quoted = await message.getQuotedMessage().catch(() => null);
+       const media = (message.hasMedia) ? await message.downloadMedia() : (quoted && quoted.hasMedia ? await quoted.downloadMedia() : null);
+       if (!media) {
+          const errorMsg = `Please reply to the file specifically to forward it to ${step.finalRecipient}.`;
+          if (statusMsg) await statusMsg.edit(errorMsg); else await message.reply(errorMsg);
+          return false;
+       }
+       const sent = await client.sendMessage(targetChatId, media, { caption: "Sent via Nexa" });
+       pushToStack(chatId, "actionStack", { type: step.type, timestamp: Date.now(), targetId: targetChatId, targetName: step.finalRecipient, messageId: sent.id._serialized });
+       return true;
+    }
+
+    // Send Message
+    if (statusMsg) await statusMsg.edit(`Polishing message for ${step.finalRecipient || step.recipient}... ✍️`);
+    const polished = await askLLM(`Rewrite for ${step.finalRecipient || step.recipient}: "${step.content}"`, `Polished message for ${step.finalRecipient}. Context: ${step.fileMeta?.content?.slice(0, 1000) || "none"}`);
+    const sanitized = sanitizeNexaResponse(polished);
+    const sent = await client.sendMessage(targetChatId, `${sanitized}\n\n_Sent via Nexa_`);
+    pushToStack(chatId, "actionStack", { type: step.type, timestamp: Date.now(), targetId: targetChatId, targetName: step.finalRecipient, messageId: sent.id._serialized, content: step.content });
+    return true;
+  }
+
+  if (step.type === "summarize_pdf") {
+      if (!step.fileMeta) return false;
+      await message.reply("Analyzing document... ⏳");
+      const summary = await askLLM(
+          `Summarize this document: ${step.fileMeta.content.slice(0, 15000)}`,
+          `Be Nexa, Prem's expert assistant. Provide 3-5 key takeaways.`
+      );
+      await message.reply(sanitizeNexaResponse(summary));
+      return true;
+  }
+
+  return false;
+}
+
+async function handleUndo(chatId, message) {
+  const lastAction = popFromStack(chatId, "actionStack");
+  if (!lastAction) return message.reply("No recent action to undo.");
+
+  try {
+    const targetChat = await client.getChatById(lastAction.targetId);
+    const msgs = await targetChat.fetchMessages({ limit: 5 });
+    const targetMsg = msgs.find(m => m.id._serialized === lastAction.messageId);
+    if (targetMsg) {
+      await targetMsg.delete(true);
+      await message.reply(`Undone: Rollback of ${lastAction.type} success. 🔙`);
+    } else {
+      throw new Error("Msg not found");
+    }
+  } catch (e) {
+    await message.reply("Correction: Please ignore the previous message from Nexa. (Physical recall failed). ⚠️");
+  }
+}
+
+module.exports = client;

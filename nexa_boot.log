@@ -1,0 +1,12 @@
+CONTACT FILE PATH: /Users/premganatra/Desktop/OpenClaw-agent/data/contacts.json
+OpenClaw running on http://127.0.0.1:5050
+/Users/premganatra/Desktop/OpenClaw-agent/node_modules/puppeteer-core/lib/cjs/puppeteer/node/BrowserLauncher.js:175
+                throw new Error(`The browser is already running for ${launchArgs.userDataDir}. Use a different \`userDataDir\` or stop the running browser first.`);
+                      ^
+
+Error: The browser is already running for /Users/premganatra/Desktop/OpenClaw-agent/.wwebjs_auth/session-openclaw-personal. Use a different `userDataDir` or stop the running browser first.
+    at ChromeLauncher.launch (/Users/premganatra/Desktop/OpenClaw-agent/node_modules/puppeteer-core/lib/cjs/puppeteer/node/BrowserLauncher.js:175:23)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Client.initialize (/Users/premganatra/Desktop/OpenClaw-agent/node_modules/whatsapp-web.js/src/Client.js:331:23)
+
+Node.js v24.12.0

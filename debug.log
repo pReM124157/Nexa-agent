@@ -1,0 +1,16 @@
+[RAW] Message received: "@nexa are you there?" | fromMe: true | from: 919321762299@c.us
+[DEBUG] Intercepting command: @nexa are you there?
+[RAW] Message received: "@nexa are you there?" | fromMe: true | from: 919321762299@c.us
+[DEBUG] Intercepting command: @nexa are you there?
+[RAW] Message received: "" | fromMe: false | from: status@broadcast
+[RAW] Message received: "@nexa are you there?" | fromMe: true | from: 919321762299@c.us
+[DEBUG] Intercepting command: @nexa are you there?
+[DEBUG] Calling LLM for intent extraction...
+[DEBUG] LLM Intent Result: {"action": "chat"}
+[DEBUG] Parsed Intent: {"action":"chat"}
+[RAW] Message received: "" | fromMe: false | from: status@broadcast
+[RAW] Message received: "@nexa are you there?" | fromMe: true | from: 919321762299@c.us
+[DEBUG] Intercepting command: @nexa are you there?
+[DEBUG] Calling LLM for intent extraction...
+[DEBUG] LLM Intent Result: {"action": "chat"}
+[DEBUG] Parsed Intent: {"action":"chat"}

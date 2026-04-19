@@ -1,0 +1,163 @@
+========================================
+STEP 3 REAL RUNTIME VALIDATION
+========================================
+
+⚠️ READ THIS FIRST
+
+You need 3 things open:
+
+1. WhatsApp chat with Nexa
+2. Terminal A: Watch bot logs (follow below)
+3. Terminal B: Run test guide
+
+========================================
+🔧 SETUP — Follow these steps
+========================================
+
+STEP 1: Open Terminal A (for logs)
+─────────────────────────────────
+
+In a NEW terminal:
+
+  cd /Users/premganatra/Desktop/OpenClaw-agent
+  npm start
+
+You will see:
+  [Server listening on port...]
+  [Client is ready!]
+
+✅ Keep this terminal OPEN and watch for logs
+
+========================================
+
+STEP 2: Open Terminal B (for test guide)
+────────────────────────────────────────
+
+In a DIFFERENT new terminal:
+
+  bash /Users/premganatra/Desktop/OpenClaw-agent/RUN_REAL_TESTS.sh
+
+This will guide you through each test step-by-step.
+
+========================================
+
+🔴 REAL TESTS (what to look for in Terminal A)
+========================================
+
+TEST 1: Send PDF
+─────────────────
+WhatsApp action:
+  → Send a PDF file to Nexa
+
+Terminal A should show:
+  [DocStore] PDF detected, extracting text...
+  [DocStore] ✅ Saved (12345@c.us): XXXX chars
+
+If NOT:
+  ❌ media detection broken
+  ❌ PDF extraction failed
+
+
+TEST 2: Direct summarize
+────────────────────────
+WhatsApp action:
+  → Send: @nexa summarize this pdf
+
+Terminal A should show:
+  [executeIntent] ✅ PDF summarized (XXXX chars)
+
+WhatsApp should show:
+  → Summary message (not "No PDF found")
+
+If NOT:
+  ❌ document retrieval failed
+  ❌ LLM call failed
+
+
+TEST 3: Reply-based summarize
+──────────────────────────────
+WhatsApp action:
+  1. Send another PDF
+  2. Reply to it: @nexa summarize this
+
+Terminal A should show:
+  [DocStore] PDF detected...
+  [DocStore] ✅ Saved
+  [executeIntent] ✅ PDF summarized
+
+WhatsApp should show:
+  → Summary message
+
+If NOT:
+  ❌ quoted message detection broken
+  ❌ execution path failed
+
+
+TEST 4: Replace document
+─────────────────────────
+WhatsApp action:
+  1. Send PDF A → wait for log → summarize → note summary
+  2. Send PDF B → wait for log → summarize → note summary
+
+Terminal A should show:
+  [DocStore] ✅ Saved ... A ...
+  [DocStore] ✅ Saved ... B ... (different char count!)
+  [executeIntent] ✅ PDF summarized (twice, different sizes)
+
+WhatsApp should show:
+  → Different summaries (summary of A ≠ summary of B)
+
+If NOT:
+  ❌ document overwrites not working
+  ❌ old PDF still in memory
+
+
+TEST 5: Fresh bot
+──────────────────
+Terminal A action:
+  → Kill bot (Ctrl+C)
+  → npm start
+  → Wait for "Client is ready!"
+
+WhatsApp action:
+  → Send: @nexa summarize this pdf
+
+Terminal A should show:
+  [DocStore] ❌ No document found
+
+WhatsApp should show:
+  → "No PDF found. Please send a document to summarize."
+
+If NOT:
+  ❌ memory not cleared on restart
+  ❌ error handling broken
+
+
+========================================
+✅ SUCCESS CRITERIA
+========================================
+
+ALL 5 tests passed if:
+
+  ✅ TEST 1: [DocStore] ✅ Saved
+  ✅ TEST 2: [executeIntent] ✅ PDF summarized + summary appears
+  ✅ TEST 3: Quoted detection works + summary appears
+  ✅ TEST 4: Two different summaries (A vs B)
+  ✅ TEST 5: "No PDF found" after restart
+
+========================================
+🚫 IF ANY TEST FAILS
+========================================
+
+Copy the EXACT logs from Terminal A
+Paste them here with description of what failed
+
+Example:
+
+  TEST 2 FAILED:
+  [Paste logs here]
+  
+  WhatsApp showed: "No PDF found" (but PDF was sent)
+  Expected: Summary message
+
+========================================
