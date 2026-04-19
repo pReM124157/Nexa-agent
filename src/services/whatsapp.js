@@ -506,7 +506,7 @@ async function initialize() {
       authStrategy: new RemoteAuth({
         store,
         backupSyncIntervalMs: 60000,
-        clientId: "nexa-session",
+        clientId: "nexa",
         dataPath: "/tmp/.wwebjs_auth"
       }),
       puppeteer: {
