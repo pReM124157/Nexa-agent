@@ -587,20 +587,25 @@ const handleMessage = async (message) => {
     const isOwner = message.fromMe;
     const isMention = text.includes("@nexa");
 
-    // STEP 1: Prevention of bot-induced loops & gating
-    // Only process personal messages if they explicitly mention Nexa (fromMe)
-    // This MUST be before logging to avoid "ghost" receipt logs
-    if (isOwner && !isMention) return;
+    // STEP 1: Logging & Initial Metadata
+    console.log(`[Incoming] From: ${message.from} | Body: ${rawBody.slice(0, 50)}`);
+
+    const chatId = message.from;
+    const isOwner = message.fromMe;
+    const isMention = text.includes("@nexa");
+
+    // STEP 2: Logic Gating
+    // 2a: Owner must mention @nexa to avoid self-reply loops
+    if (isOwner && !isMention) {
+      return; // Silent skip for owner's non-bot messages
+    }
 
     console.log("🔥 MESSAGE RECEIVED:", rawBody);
 
-    const chatId = message.from;
-    console.log("CHAT ID:", chatId);
-
-    // STEP 2: Only allow direct chats (@c.us or @lid)
-    const isDirectChat = chatId.endsWith("@c.us") || chatId.endsWith("@lid");
-    if (!isDirectChat) {
-      console.log("SKIPPED: Not a direct chat (group or other type)");
+    // 2b: Allowed Chat Types (Direct, Groups, and LIDs)
+    const isAllowedChat = chatId.endsWith("@c.us") || chatId.endsWith("@lid") || chatId.endsWith("@g.us");
+    if (!isAllowedChat) {
+      console.log(`SKIPPED: Unsupported chat type (${chatId})`);
       return;
     }
 
