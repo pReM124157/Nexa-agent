@@ -6,17 +6,8 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
 
-const {
-  default: makeWASocket,
-  Browsers,
-  BufferJSON,
-  DisconnectReason,
-  downloadMediaMessage,
-  fetchLatestBaileysVersion,
-  initAuthCreds,
-  makeCacheableSignalKeyStore,
-  proto
-} = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, Browsers } = require('@whiskeysockets/baileys');
+const { DisconnectReason, downloadMediaMessage } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const QRCode = require("qrcode");
 const { connectDB, mongoose } = require('../db');
@@ -484,9 +475,8 @@ let socket = null;
 let schedulerStarted = false;
 let isInitializing = false;
 let reconnectTimer = null;
-let loadedExistingSession = false;
-let authStateData = { creds: initAuthCreds(), keys: {} };
-let authPersistQueue = Promise.resolve();
+let baileysAuthState = null;
+let saveCredsHandler = null;
 const sentMessagesCache = new Map();
 const outboundQueue = [];
 let processingOutboundQueue = false;
@@ -498,98 +488,12 @@ let isShuttingDown = false;
 let cleanupCounter = 0;
 
 const BAILEYS_LOGGER = pino({ level: process.env.BAILEYS_LOG_LEVEL || "error" });
-const SESSION_COLLECTION = "whatsapp_sessions";
-const SESSION_DOC_ID = "nexa-session";
 const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
 const SEND_DELAY_MS = 100;
 const MAX_QUEUE_SIZE = 100;
 const MAX_SEND_ATTEMPTS = 2;
 const MAX_MESSAGE_CHARS = 5000;
 const DEDUPE_TTL_MS = 10 * 60 * 1000;
-
-function getSessionCollection() {
-  return mongoose.connection.collection(SESSION_COLLECTION);
-}
-
-async function persistAuthState() {
-  const collection = getSessionCollection();
-  await collection.updateOne(
-    { _id: SESSION_DOC_ID },
-    {
-      $set: {
-        creds: JSON.parse(JSON.stringify(authStateData.creds, BufferJSON.replacer)),
-        keys: JSON.parse(JSON.stringify(authStateData.keys, BufferJSON.replacer)),
-        updatedAt: new Date()
-      }
-    },
-    { upsert: true, maxTimeMS: 5000 }
-  );
-  console.log("✅ SESSION SAVED TO MONGODB");
-}
-
-function queuePersistAuthState() {
-  authPersistQueue = authPersistQueue
-    .then(() => persistAuthState())
-    .catch((err) => {
-      console.error("Failed persisting auth state:", err.message);
-    });
-  return authPersistQueue;
-}
-
-async function loadAuthStateFromMongo() {
-  const collection = getSessionCollection();
-  const existing = await collection.findOne({ _id: SESSION_DOC_ID });
-  if (!existing) {
-    authStateData = { creds: initAuthCreds(), keys: {} };
-    loadedExistingSession = false;
-    return;
-  }
-
-  const loadedCreds = existing.creds ? JSON.parse(JSON.stringify(existing.creds), BufferJSON.reviver) : null;
-  const loadedKeys = existing.keys ? JSON.parse(JSON.stringify(existing.keys), BufferJSON.reviver) : null;
-  authStateData = {
-    creds: loadedCreds || initAuthCreds(),
-    keys: loadedKeys || {}
-  };
-  loadedExistingSession = true;
-  console.log("✅ AUTHENTICATED — session loaded from MongoDB");
-}
-
-async function resetAuthState() {
-  authStateData = { creds: initAuthCreds(), keys: {} };
-  loadedExistingSession = false;
-  const collection = getSessionCollection();
-  await collection.deleteOne({ _id: SESSION_DOC_ID }, { maxTimeMS: 5000 });
-}
-
-function createBaileysAuthState() {
-  return {
-    creds: authStateData.creds,
-    keys: {
-      get: async (type, ids) => {
-        const data = {};
-        for (const id of ids) {
-          let value = authStateData.keys?.[type]?.[id];
-          if (type === "app-state-sync-key" && value) {
-            value = proto.Message.AppStateSyncKeyData.fromObject(value);
-          }
-          data[id] = value;
-        }
-        return data;
-      },
-      set: async (data) => {
-        for (const [type, values] of Object.entries(data || {})) {
-          authStateData.keys[type] = authStateData.keys[type] || {};
-          for (const [id, value] of Object.entries(values)) {
-            if (value) authStateData.keys[type][id] = value;
-            else delete authStateData.keys[type][id];
-          }
-        }
-        await queuePersistAuthState();
-      }
-    }
-  };
-}
 
 function toBaileysJid(id = "") {
   if (!id) return id;
@@ -914,28 +818,18 @@ async function startSocket() {
     }
   }
 
-  const authState = createBaileysAuthState();
-  const versionInfo = await fetchLatestBaileysVersion().catch(() => null);
-  socket = makeWASocket({
-    auth: {
-      creds: authState.creds,
-      keys: makeCacheableSignalKeyStore(authState.keys, BAILEYS_LOGGER)
-    },
-    browser: Browsers.macOS("Nexa"),
-    printQRInTerminal: false,
-    markOnlineOnConnect: false,
-    defaultQueryTimeoutMs: 60000,
-    logger: BAILEYS_LOGGER,
-    version: versionInfo?.version
+  const sock = makeWASocket({
+    auth: baileysAuthState,
+    browser: Browsers.macOS("Chrome"),
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 10000,
+    printQRInTerminal: true
   });
+  socket = sock;
 
-  socket.ev.on("creds.update", async (creds) => {
-    authStateData.creds = creds;
-    await queuePersistAuthState();
-    console.log("Session updated in Mongo");
-  });
+  sock.ev.on("creds.update", saveCredsHandler);
 
-  socket.ev.on("connection.update", async (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -957,9 +851,6 @@ async function startSocket() {
         console.log("Reminder scheduler started");
       }
       console.log("✅ Nexa is ready ✅");
-      if (loadedExistingSession) {
-        console.log("✅ Session restored: YES");
-      }
     }
 
     if (connection === "close") {
@@ -972,7 +863,6 @@ async function startSocket() {
       console.log("❌ Client disconnected:", statusCode || "unknown");
 
       if (isLoggedOut) {
-        await resetAuthState();
         reconnectDelayMs = 3000;
         console.log("Session logged out. Waiting for new QR authentication.");
         scheduleReconnect(1000);
@@ -983,7 +873,7 @@ async function startSocket() {
     }
   });
 
-  socket.ev.on("messages.upsert", ({ messages }) => {
+  sock.ev.on("messages.upsert", ({ messages }) => {
     for (const msg of messages || []) {
       if (!msg?.message) continue;
       if (msg.key?.remoteJid === "status@broadcast") continue;
@@ -1006,7 +896,9 @@ function bindShutdownHooks() {
     if (isShuttingDown) return;
     isShuttingDown = true;
     try {
-      await queuePersistAuthState();
+      if (saveCredsHandler) {
+        await saveCredsHandler();
+      }
       console.log(`Graceful shutdown complete (${signal})`);
     } catch (err) {
       console.error("Shutdown persistence failed:", err.message);
@@ -1030,6 +922,9 @@ async function initialize() {
 
   try {
     await connectDB();
+    const { state, saveCreds } = await useMultiFileAuthState("auth");
+    baileysAuthState = state;
+    saveCredsHandler = saveCreds;
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("Mongo DB not ready in time")), 10000);
@@ -1045,7 +940,6 @@ async function initialize() {
     });
 
     client = createClientWrapper();
-    await loadAuthStateFromMongo();
     await startSocket();
     bindShutdownHooks();
   } finally {
