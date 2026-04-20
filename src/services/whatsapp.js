@@ -6,9 +6,19 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
 
-const { Client, RemoteAuth } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
-const { MongoStore } = require('wwebjs-mongo');
+const {
+  default: makeWASocket,
+  Browsers,
+  BufferJSON,
+  DisconnectReason,
+  downloadMediaMessage,
+  fetchLatestBaileysVersion,
+  initAuthCreds,
+  makeCacheableSignalKeyStore,
+  proto
+} = require("@whiskeysockets/baileys");
+const pino = require("pino");
+const QRCode = require("qrcode");
 const { connectDB, mongoose } = require('../db');
 const axios = require("axios");
 
@@ -470,110 +480,580 @@ const ALLOWED_NUMBERS = [
 
 
 let client;
+let socket = null;
+let schedulerStarted = false;
+let isInitializing = false;
+let reconnectTimer = null;
+let loadedExistingSession = false;
+let authStateData = { creds: initAuthCreds(), keys: {} };
+let authPersistQueue = Promise.resolve();
+const sentMessagesCache = new Map();
+const outboundQueue = [];
+let processingOutboundQueue = false;
+let reconnecting = false;
+let reconnectAttempts = 0;
+let shutdownHooksBound = false;
+let reconnectDelayMs = 3000;
+let isShuttingDown = false;
+let cleanupCounter = 0;
+
+const BAILEYS_LOGGER = pino({ level: process.env.BAILEYS_LOG_LEVEL || "error" });
+const SESSION_COLLECTION = "whatsapp_sessions";
+const SESSION_DOC_ID = "nexa-session";
+const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
+const SEND_DELAY_MS = 100;
+const MAX_QUEUE_SIZE = 100;
+const MAX_SEND_ATTEMPTS = 2;
+const MAX_MESSAGE_CHARS = 5000;
+const DEDUPE_TTL_MS = 10 * 60 * 1000;
+
+function getSessionCollection() {
+  return mongoose.connection.collection(SESSION_COLLECTION);
+}
+
+async function persistAuthState() {
+  const collection = getSessionCollection();
+  await collection.updateOne(
+    { _id: SESSION_DOC_ID },
+    {
+      $set: {
+        creds: JSON.parse(JSON.stringify(authStateData.creds, BufferJSON.replacer)),
+        keys: JSON.parse(JSON.stringify(authStateData.keys, BufferJSON.replacer)),
+        updatedAt: new Date()
+      }
+    },
+    { upsert: true, maxTimeMS: 5000 }
+  );
+  console.log("✅ SESSION SAVED TO MONGODB");
+}
+
+function queuePersistAuthState() {
+  authPersistQueue = authPersistQueue
+    .then(() => persistAuthState())
+    .catch((err) => {
+      console.error("Failed persisting auth state:", err.message);
+    });
+  return authPersistQueue;
+}
+
+async function loadAuthStateFromMongo() {
+  const collection = getSessionCollection();
+  const existing = await collection.findOne({ _id: SESSION_DOC_ID });
+  if (!existing) {
+    authStateData = { creds: initAuthCreds(), keys: {} };
+    loadedExistingSession = false;
+    return;
+  }
+
+  const loadedCreds = existing.creds ? JSON.parse(JSON.stringify(existing.creds), BufferJSON.reviver) : null;
+  const loadedKeys = existing.keys ? JSON.parse(JSON.stringify(existing.keys), BufferJSON.reviver) : null;
+  authStateData = {
+    creds: loadedCreds || initAuthCreds(),
+    keys: loadedKeys || {}
+  };
+  loadedExistingSession = true;
+  console.log("✅ AUTHENTICATED — session loaded from MongoDB");
+}
+
+async function resetAuthState() {
+  authStateData = { creds: initAuthCreds(), keys: {} };
+  loadedExistingSession = false;
+  const collection = getSessionCollection();
+  await collection.deleteOne({ _id: SESSION_DOC_ID }, { maxTimeMS: 5000 });
+}
+
+function createBaileysAuthState() {
+  return {
+    creds: authStateData.creds,
+    keys: {
+      get: async (type, ids) => {
+        const data = {};
+        for (const id of ids) {
+          let value = authStateData.keys?.[type]?.[id];
+          if (type === "app-state-sync-key" && value) {
+            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+          }
+          data[id] = value;
+        }
+        return data;
+      },
+      set: async (data) => {
+        for (const [type, values] of Object.entries(data || {})) {
+          authStateData.keys[type] = authStateData.keys[type] || {};
+          for (const [id, value] of Object.entries(values)) {
+            if (value) authStateData.keys[type][id] = value;
+            else delete authStateData.keys[type][id];
+          }
+        }
+        await queuePersistAuthState();
+      }
+    }
+  };
+}
+
+function toBaileysJid(id = "") {
+  if (!id) return id;
+  if (id.endsWith("@c.us")) return id.replace("@c.us", "@s.whatsapp.net");
+  if (id.endsWith("@lid")) return id.replace("@lid", "@lid.whatsapp.net");
+  return id;
+}
+
+function fromBaileysJid(jid = "") {
+  if (!jid) return jid;
+  const normalized = jid.replace(/:\d+@/, "@");
+  if (normalized.endsWith("@s.whatsapp.net")) return normalized.replace("@s.whatsapp.net", "@c.us");
+  if (normalized.endsWith("@lid.whatsapp.net")) return normalized.replace("@lid.whatsapp.net", "@lid");
+  return normalized;
+}
+
+async function processOutboundQueue() {
+  if (processingOutboundQueue) return;
+  processingOutboundQueue = true;
+  try {
+    while (outboundQueue.length > 0) {
+      const job = outboundQueue.shift();
+      let sent = null;
+      let lastErr = null;
+
+      for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
+        try {
+          sent = await socket.sendMessage(job.chatId, job.payload, job.options || {});
+          break;
+        } catch (err) {
+          lastErr = err;
+          console.error(`Send failed (attempt ${attempt}/${MAX_SEND_ATTEMPTS}):`, err.message);
+          if (attempt < MAX_SEND_ATTEMPTS) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
+        }
+      }
+
+      if (sent) {
+        job.resolve(sent);
+      } else {
+        job.reject(lastErr || new Error("Send failed"));
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, SEND_DELAY_MS));
+    }
+  } finally {
+    processingOutboundQueue = false;
+  }
+}
+
+function enqueueSend(chatId, payload, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (outboundQueue.length >= MAX_QUEUE_SIZE) {
+      reject(new Error("Outbound queue overflow"));
+      return;
+    }
+    outboundQueue.push({ chatId, payload, options, resolve, reject });
+    processOutboundQueue().catch((err) => {
+      console.error("Outbound queue failure:", err.message);
+    });
+  });
+}
+
+function getInnerMessage(messageNode = {}) {
+  return (
+    messageNode.ephemeralMessage?.message ||
+    messageNode.viewOnceMessage?.message ||
+    messageNode.viewOnceMessageV2?.message ||
+    messageNode.viewOnceMessageV2Extension?.message ||
+    messageNode
+  );
+}
+
+function getMessageType(content = {}) {
+  return Object.keys(content)[0];
+}
+
+function extractBody(content = {}) {
+  const msg = getInnerMessage(content);
+  if (!msg || typeof msg !== "object") return "";
+
+  return (
+    msg.conversation ||
+    msg.extendedTextMessage?.text ||
+    msg.imageMessage?.caption ||
+    msg.videoMessage?.caption ||
+    msg.documentMessage?.caption ||
+    msg.buttonsResponseMessage?.selectedButtonId ||
+    msg.buttonsResponseMessage?.selectedDisplayText ||
+    msg.listResponseMessage?.title ||
+    msg.templateButtonReplyMessage?.selectedDisplayText ||
+    ""
+  );
+}
+
+function extractContextInfo(content = {}) {
+  const msg = getInnerMessage(content);
+  const type = getMessageType(msg);
+  if (!type) return null;
+  return msg[type]?.contextInfo || null;
+}
+
+function extractMediaNode(content = {}) {
+  const msg = getInnerMessage(content);
+  return (
+    msg.imageMessage ||
+    msg.videoMessage ||
+    msg.documentMessage ||
+    msg.audioMessage ||
+    msg.stickerMessage ||
+    null
+  );
+}
+
+function hasMedia(content = {}) {
+  return !!extractMediaNode(content);
+}
+
+function pushSentMessage(chatId, key) {
+  const arr = sentMessagesCache.get(chatId) || [];
+  arr.push({ key, at: Date.now() });
+  if (arr.length > 200) arr.shift();
+  sentMessagesCache.set(chatId, arr);
+}
+
+function createSentMessageHandle(chatId, key) {
+  const targetJid = toBaileysJid(chatId);
+  return {
+    id: { _serialized: key?.id || `msg_${Date.now()}` },
+    key,
+    async edit(text) {
+      if (!socket) throw new Error("WhatsApp socket is not connected");
+      try {
+        if (this.key?.id) {
+          await enqueueSend(targetJid, { delete: this.key });
+        }
+      } catch (err) {
+        console.warn("[Baileys] edit delete fallback:", err.message);
+      }
+      const payload = typeof text === "string" ? { text } : text;
+      const sent = await enqueueSend(targetJid, payload);
+      pushSentMessage(chatId, sent.key);
+      this.id = { _serialized: sent.key?.id || this.id._serialized };
+      this.key = sent.key;
+      return this;
+    },
+    async delete() {
+      if (!socket || !this.key?.id) return false;
+      await enqueueSend(targetJid, { delete: this.key });
+      return true;
+    }
+  };
+}
+
+function buildMediaPayload(media, options = {}) {
+  const mime = media.mimetype || "";
+  const buffer = Buffer.from(media.data || "", "base64");
+  if (buffer.length > MAX_MEDIA_BYTES) {
+    throw new Error("File too large");
+  }
+  const payload = {};
+
+  if (mime.startsWith("image/")) payload.image = buffer;
+  else if (mime.startsWith("video/")) payload.video = buffer;
+  else payload.document = buffer;
+
+  payload.mimetype = mime || "application/octet-stream";
+  if (options.caption) payload.caption = options.caption;
+  return payload;
+}
+
+function createClientWrapper() {
+  return {
+    async sendMessage(chatId, content, options = {}) {
+      if (!socket) throw new Error("WhatsApp socket is not connected");
+      const targetJid = toBaileysJid(chatId);
+
+      let payload;
+      if (typeof content === "string") {
+        payload = { text: content };
+      } else if (content && content.mimetype && content.data) {
+        payload = buildMediaPayload(content, options);
+      } else if (content && typeof content === "object") {
+        payload = content;
+      } else {
+        throw new Error("Unsupported sendMessage payload");
+      }
+
+      const sent = await enqueueSend(targetJid, payload, options);
+      pushSentMessage(chatId, sent.key);
+      return createSentMessageHandle(chatId, sent.key);
+    },
+
+    async getChatById(chatId) {
+      return {
+        fetchMessages: async ({ limit = 20 } = {}) => {
+          const cached = sentMessagesCache.get(chatId) || [];
+          return cached
+            .slice(-Math.max(1, limit))
+            .reverse()
+            .map((entry) => createSentMessageHandle(chatId, entry.key));
+        }
+      };
+    }
+  };
+}
+
+function adaptMessage(baileysMsg) {
+  if (!baileysMsg?.key?.remoteJid) return null;
+  const chatId = fromBaileysJid(baileysMsg.key.remoteJid);
+  const contextInfo = extractContextInfo(baileysMsg.message || {});
+  const mediaNode = extractMediaNode(baileysMsg.message || {});
+  const msgId = baileysMsg.key.id || `${chatId}_${Date.now()}`;
+  const sourceKey = {
+    ...baileysMsg.key,
+    remoteJid: toBaileysJid(chatId)
+  };
+  const outboundChatJid = toBaileysJid(chatId);
+
+  return {
+    body: extractBody(baileysMsg.message || {}),
+    from: chatId,
+    author: fromBaileysJid(contextInfo?.participant || baileysMsg.key.participant || ""),
+    fromMe: !!baileysMsg.key.fromMe,
+    hasMedia: hasMedia(baileysMsg.message || {}),
+    id: { _serialized: msgId },
+    reply: async (text) => {
+      const payload = typeof text === "string" ? { text } : text;
+      const sent = await enqueueSend(outboundChatJid, payload, { quoted: baileysMsg });
+      pushSentMessage(chatId, sent.key);
+      return createSentMessageHandle(chatId, sent.key);
+    },
+    react: async (emoji) => {
+      if (!socket) throw new Error("WhatsApp socket is not connected");
+      return enqueueSend(outboundChatJid, {
+        react: { text: emoji, key: sourceKey }
+      });
+    },
+    downloadMedia: async () => {
+      if (!mediaNode) return null;
+      const buffer = await downloadMediaMessage(
+        baileysMsg,
+        "buffer",
+        {},
+        { logger: BAILEYS_LOGGER, reuploadRequest: socket.updateMediaMessage }
+      );
+      if (!buffer) return null;
+      if (buffer.length > MAX_MEDIA_BYTES) {
+        throw new Error("File too large");
+      }
+      if (buffer.length > 2 * 1024 * 1024) {
+        return {
+          mimetype: mediaNode.mimetype || "application/octet-stream",
+          data: null,
+          note: "file too large for base64 inline transport"
+        };
+      }
+      return {
+        mimetype: mediaNode.mimetype || "application/octet-stream",
+        data: Buffer.from(buffer).toString("base64")
+      };
+    },
+    getQuotedMessage: async () => {
+      if (!contextInfo?.quotedMessage || !contextInfo?.stanzaId) return null;
+      const quotedKey = {
+        id: contextInfo.stanzaId,
+        remoteJid: contextInfo.remoteJid || toBaileysJid(chatId),
+        participant: contextInfo.participant,
+        fromMe: fromBaileysJid(contextInfo.participant || "") === fromBaileysJid(socket?.user?.id || "")
+      };
+      return adaptMessage({
+        key: quotedKey,
+        message: contextInfo.quotedMessage,
+        messageTimestamp: baileysMsg.messageTimestamp
+      });
+    },
+    getContact: async () => {
+      const senderJid = fromBaileysJid(contextInfo?.participant || baileysMsg.key.participant || baileysMsg.key.remoteJid);
+      return { number: (senderJid.split("@")[0] || "").replace(/\D/g, "") };
+    }
+  };
+}
+
+function scheduleReconnect(delayMs = 3000) {
+  if (isShuttingDown) return;
+  if (reconnecting) return;
+  if (reconnectAttempts >= 5) {
+    console.error("Too many reconnect attempts. Exiting process for clean restart.");
+    process.exit(1);
+  }
+  const nextDelay = Math.min(delayMs || reconnectDelayMs, 30000);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnecting = true;
+  reconnectAttempts += 1;
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    try {
+      await startSocket();
+      reconnecting = false;
+      reconnectDelayMs = 3000;
+    } catch (err) {
+      console.error("Reconnect failed:", err.message);
+      reconnecting = false;
+      reconnectDelayMs = Math.min(nextDelay * 2, 30000);
+      scheduleReconnect(reconnectDelayMs);
+    }
+  }, nextDelay);
+}
+
+async function startSocket() {
+  if (socket) {
+    try {
+      socket.ev.removeAllListeners("connection.update");
+      socket.ev.removeAllListeners("messages.upsert");
+      socket.ev.removeAllListeners("creds.update");
+      if (typeof socket.end === "function") {
+        socket.end(new Error("socket-restart"));
+      }
+    } catch (err) {
+      console.warn("Previous socket cleanup warning:", err.message);
+    }
+  }
+
+  const authState = createBaileysAuthState();
+  const versionInfo = await fetchLatestBaileysVersion().catch(() => null);
+  socket = makeWASocket({
+    auth: {
+      creds: authState.creds,
+      keys: makeCacheableSignalKeyStore(authState.keys, BAILEYS_LOGGER)
+    },
+    browser: Browsers.macOS("Nexa"),
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    defaultQueryTimeoutMs: 60000,
+    logger: BAILEYS_LOGGER,
+    version: versionInfo?.version
+  });
+
+  socket.ev.on("creds.update", async (creds) => {
+    authStateData.creds = creds;
+    await queuePersistAuthState();
+    console.log("Session updated in Mongo");
+  });
+
+  socket.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      try {
+        global.lastQR = await QRCode.toDataURL(qr);
+        console.log("QR available at /qr endpoint");
+      } catch (err) {
+        console.error("QR image generation failed:", err.message);
+      }
+    }
+
+    if (connection === "open") {
+      global.isReady = true;
+      global.lastQR = null;
+      reconnectAttempts = 0;
+      if (!schedulerStarted) {
+        startReminderScheduler(client);
+        schedulerStarted = true;
+        console.log("Reminder scheduler started");
+      }
+      console.log("✅ Nexa is ready ✅");
+      if (loadedExistingSession) {
+        console.log("✅ Session restored: YES");
+      }
+    }
+
+    if (connection === "close") {
+      global.isReady = false;
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode ||
+        lastDisconnect?.error?.data?.statusCode ||
+        null;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+      console.log("❌ Client disconnected:", statusCode || "unknown");
+
+      if (isLoggedOut) {
+        await resetAuthState();
+        reconnectDelayMs = 3000;
+        console.log("Session logged out. Waiting for new QR authentication.");
+        scheduleReconnect(1000);
+        return;
+      }
+
+      scheduleReconnect(reconnectDelayMs);
+    }
+  });
+
+  socket.ev.on("messages.upsert", ({ messages }) => {
+    for (const msg of messages || []) {
+      if (!msg?.message) continue;
+      if (msg.key?.remoteJid === "status@broadcast") continue;
+
+      const adapted = adaptMessage(msg);
+      if (!adapted) continue;
+      if (!adapted.body && !adapted.hasMedia) continue;
+      handleMessage(adapted).catch((err) => {
+        console.error("Message handling error:", err.message);
+      });
+    }
+  });
+}
+
+function bindShutdownHooks() {
+  if (shutdownHooksBound) return;
+  shutdownHooksBound = true;
+
+  const flushAndExit = async (signal) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    try {
+      await queuePersistAuthState();
+      console.log(`Graceful shutdown complete (${signal})`);
+    } catch (err) {
+      console.error("Shutdown persistence failed:", err.message);
+    } finally {
+      process.exit(0);
+    }
+  };
+
+  process.on("SIGINT", async () => {
+    await flushAndExit("SIGINT");
+  });
+  process.on("SIGTERM", async () => {
+    await flushAndExit("SIGTERM");
+  });
+}
 
 async function initialize() {
-  await connectDB();
-  
-    // SANITY CHECK: One mongoose instance only
-    console.log("Mongoose Path:", require.resolve('mongoose'));
+  if (isInitializing) return;
+  isInitializing = true;
+  global.lastQR = null;
 
-    // 1. Connect to DB
+  try {
     await connectDB();
 
-    // 2. HARD WAIT for DB object (not just readyState)
     await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error("Mongo DB not ready in time"));
-      }, 10000);
-      function check() {
+      const timeout = setTimeout(() => reject(new Error("Mongo DB not ready in time")), 10000);
+      const check = () => {
         if (mongoose.connection.readyState === 1 && mongoose.connection.db) {
           clearTimeout(timeout);
           resolve();
-        } else {
-          setTimeout(check, 100);
+          return;
         }
-      }
+        setTimeout(check, 100);
+      };
       check();
     });
 
-    console.log("✅ Mongoose readyState:", mongoose.connection.readyState);
-    console.log("DB object:", mongoose.connection.db ? "Initialized ✅" : "Missing ❌");
-
-    // NOW create store (safe)
-    const store = new MongoStore({ mongoose });
-
-    client = new Client({
-      authStrategy: new RemoteAuth({
-        store,
-        backupSyncIntervalMs: 60000,
-        clientId: "nexa",
-        dataPath: "/tmp/.wwebjs_auth"
-      }),
-      puppeteer: {
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-accelerated-2d-canvas",
-          "--no-first-run",
-          "--no-zygote",
-          "--single-process",
-          "--disable-gpu"
-        ]
-      }
-    });
-
-let schedulerStarted = false;
-
-global.lastQR = null;
-
-client.on("qr", async (qr) => {
-  console.log("\nScan this QR with WhatsApp:\n");
-  qrcode.generate(qr, { small: true });
-  
-  try {
-    const QRCode = require('qrcode');
-    global.lastQR = await QRCode.toDataURL(qr);
-    console.log("QR available at /qr endpoint");
-  } catch(e) {
-    console.error("QR image generation failed:", e.message);
+    client = createClientWrapper();
+    await loadAuthStateFromMongo();
+    await startSocket();
+    bindShutdownHooks();
+  } finally {
+    isInitializing = false;
   }
-});
+}
 
-client.on("remote_session_saved", () => {
-  console.log("✅ SESSION SAVED TO MONGODB");
-});
-
-client.on("ready", () => {
-  console.log("✅ Nexa is ready ✅");
-  global.isReady = true;
-  console.log("✅ Session restored:", client.info ? "YES" : "NO");
-
-  if (!schedulerStarted) {
-    startReminderScheduler(client);
-    schedulerStarted = true;
-    console.log("Reminder scheduler started");
-  }
-});
-
-client.on("change_state", (state) => {
-  console.log("📡 Connection state changed:", state);
-});
-
-client.on("disconnected", (reason) => {
-  console.log("❌ Client disconnected:", reason);
-});
-
-client.on("authenticated", () => {
-  console.log("✅ AUTHENTICATED — session loaded from MongoDB");
-});
-
-client.on("auth_failure", (msg) => {
-  console.error("❌ AUTH FAILED:", msg);
-});
-
-const processedMessages = new Set();
+const processedMessages = new Map();
 
 // ================================================================
 // 4-LAYER ARCHITECTURE: MESSAGE HANDLER
@@ -581,22 +1061,30 @@ const processedMessages = new Set();
 
 const handleMessage = async (message) => {
   // STEP 0: Deduplication Gate (Prevents double-firing for contacts)
-  if (processedMessages.has(message.id._serialized)) return;
-  processedMessages.add(message.id._serialized);
-  
-  // Cleanup cache every 10 minutes to prevent memory bloat
-  setTimeout(() => processedMessages.delete(message.id._serialized), 600000);
+  const msgId = message.id?._serialized;
+  if (!msgId) return;
+  const now = Date.now();
+  const existing = processedMessages.get(msgId);
+  if (existing && now - existing < DEDUPE_TTL_MS) return;
+  processedMessages.set(msgId, now);
+  cleanupCounter += 1;
+  if (cleanupCounter % 50 === 0) {
+    for (const [id, ts] of processedMessages.entries()) {
+      if (now - ts > DEDUPE_TTL_MS) processedMessages.delete(id);
+    }
+  }
 
   try {
     const rawBody = (message.body || "").trim();
-    if (!rawBody) return;
+    const safeBody = rawBody.length > MAX_MESSAGE_CHARS ? rawBody.slice(0, MAX_MESSAGE_CHARS) : rawBody;
+    if (!safeBody && !message.hasMedia) return;
 
-    const text = rawBody.toLowerCase();
+    const text = safeBody.toLowerCase();
     const isOwner = message.fromMe;
     const isMention = text.includes("@nexa");
 
     // STEP 1: Logging & Initial Metadata
-    console.log(`[Incoming] From: ${message.from} | Body: ${rawBody.slice(0, 50)}`);
+    console.log(`[Incoming] From: ${message.from} | Body: ${safeBody.slice(0, 50)}`);
 
     const chatId = message.from;
 
@@ -606,7 +1094,7 @@ const handleMessage = async (message) => {
       return; // Silent skip for owner's non-bot messages
     }
 
-    console.log("🔥 MESSAGE RECEIVED:", rawBody);
+    console.log("🔥 MESSAGE RECEIVED:", safeBody);
 
     // 2b: Allowed Chat Types (Direct, Groups, and LIDs)
     const isAllowedChat = chatId.endsWith("@c.us") || chatId.endsWith("@lid") || chatId.endsWith("@g.us");
@@ -627,7 +1115,7 @@ const handleMessage = async (message) => {
     }
 
     // Clean text for processing
-    const cleanText = rawBody.replace(/@nexa/gi, "").trim();
+    const cleanText = safeBody.replace(/@nexa/gi, "").trim();
     const cleanTextLower = cleanText.toLowerCase();
 
     console.log("🚀 PROCESSING:", cleanText);
@@ -721,6 +1209,10 @@ const handleMessage = async (message) => {
           console.log("[DocStore] Media download failed");
           // Don't reply - silent failure
           // Continue processing user message normally
+        } else if (!media.data) {
+          console.log("[DocStore] Media too large for in-memory handling");
+          await message.reply("The file is too large to process in memory. Please send a smaller file.");
+          return;
         } else if (media.mimetype.includes("pdf")) {
           // PDF detected - extract and store
           console.log("[DocStore] PDF detected, extracting text...");
@@ -761,7 +1253,7 @@ const handleMessage = async (message) => {
     }
 
     // Record message in memory
-    addMessageToMemory(chatId, "user", rawBody);
+    addMessageToMemory(chatId, "user", safeBody);
 
     // --- INTENT ROUTING (SINGLE VS MULTI-STEP) ---
     const isMultiStep = cleanTextLower.includes(" and ") || cleanTextLower.includes(" then ");
@@ -964,16 +1456,6 @@ const handleMessage = async (message) => {
   }
 };
 
-client.on("message", (msg) => {
-  handleMessage(msg);
-});
-client.on("message_create", (msg) => {
-  // ONLY process self-chat mentions
-  if (msg.fromMe && msg.body?.toLowerCase().includes("@nexa")) {
-    handleMessage(msg);
-  }
-});
-
 /**
  * Helper to identify task intents.
  */
@@ -1171,7 +1653,7 @@ async function executeIntent(parsedIntent, message, chatId, statusMsg = null) {
   // STEP 1: Confidence & Auto-Repair Gate
   const confidence = validateConfidence(parsedIntent);
   console.log("🔴 CONFIDENCE VALUE:", confidence);
-  const rawBody = message.body?.replace(/@nexa/gi, "").trim();
+  const rawBody = (message.body || "").replace(/@nexa/gi, "").trim().slice(0, MAX_MESSAGE_CHARS);
 
   // Smart Retry: Auto-repair if intent is "none"
   if (parsedIntent.intent === "none" || !parsedIntent.intent) {
@@ -1284,6 +1766,11 @@ async function executeIntent(parsedIntent, message, chatId, statusMsg = null) {
       const media = (message.hasMedia) ? await message.downloadMedia() : (quoted && quoted.hasMedia ? await quoted.downloadMedia() : null);
       if (!media) {
         const errorMsg = `Please reply to the file specifically to forward it to ${resolved.name}.`;
+        if (statusMsg) await statusMsg.edit(errorMsg); else await message.reply(errorMsg);
+        return false;
+      }
+      if (!media.data) {
+        const errorMsg = "This file is too large to forward in memory. Please share a smaller file.";
         if (statusMsg) await statusMsg.edit(errorMsg); else await message.reply(errorMsg);
         return false;
       }
@@ -1543,6 +2030,11 @@ async function executeStep(step, message, statusMsg = null, chatId) {
         if (statusMsg) await statusMsg.edit(errorMsg); else await message.reply(errorMsg);
         return false;
       }
+      if (!media.data) {
+        const errorMsg = "This file is too large to forward in memory. Please share a smaller file.";
+        if (statusMsg) await statusMsg.edit(errorMsg); else await message.reply(errorMsg);
+        return false;
+      }
 
       // STEP 3: EXECUTE - Send file
       const sent = await client.sendMessage(targetChatId, media, { caption: "Sent via Nexa" });
@@ -1602,9 +2094,6 @@ async function handleUndo(chatId, message) {
   } catch (e) {
     await message.reply("Correction: Please ignore the previous message from Nexa. (Physical recall failed). ⚠️");
   }
-}
-
-  await client.initialize();
 }
 
 module.exports = { initialize, getClient: () => client };

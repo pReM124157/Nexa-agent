@@ -7,9 +7,21 @@ async function connectDB() {
   }
 
   try {
-    await mongoose.connect(process.env.MONGO_URI);
-    console.log("MongoDB connected ✅");
+    if (mongoose.connection.readyState === 1) {
+      return mongoose;
+    }
+
+    if (!global.__mongooseConnectPromise) {
+      global.__mongooseConnectPromise = mongoose.connect(process.env.MONGO_URI);
+      await global.__mongooseConnectPromise;
+      console.log("MongoDB connected ✅");
+      return mongoose;
+    }
+
+    await global.__mongooseConnectPromise;
+    return mongoose;
   } catch (error) {
+    global.__mongooseConnectPromise = null;
     console.error(`MongoDB Connection Error: ${error.message}`);
     process.exit(1);
   }
