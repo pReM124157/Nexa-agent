@@ -37,7 +37,9 @@ app.get('/qr', async (req, res) => {
   if (!global.lastQR) {
     return res.send("QR not ready yet");
   }
-  const qrImage = await QRCode.toDataURL(global.lastQR);
+  const qrImage = String(global.lastQR).startsWith("data:image")
+    ? global.lastQR
+    : await QRCode.toDataURL(global.lastQR);
   res.send(`<img src="${qrImage}" />`);
 });
 

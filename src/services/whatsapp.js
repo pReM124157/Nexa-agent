@@ -826,12 +826,17 @@ async function startSocket() {
 
   sock.ev.on("creds.update", saveCredsHandler);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { qr, connection } = update;
     console.log("UPDATE:", update); // 👈 DEBUG (IMPORTANT)
     if (qr) {
       console.log("QR RECEIVED");
-      global.lastQR = qr;
+      try {
+        global.lastQR = await QRCode.toDataURL(qr);
+        console.log("QR available at /qr endpoint");
+      } catch(e) {
+        global.lastQR = qr;
+      }
     }
     if (connection === "open") {
       console.log("Nexa is ready ✅");
