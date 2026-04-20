@@ -10,6 +10,7 @@ process.on('uncaughtException', (err) => {
 
 const express = require('express');
 const app = express();
+const QRCode = require('qrcode');
 const whatsappClient = require("./services/whatsapp");
 const { getRepos } = require("./services/githubService");
 
@@ -32,26 +33,12 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.get('/qr', (req, res) => {
+app.get('/qr', async (req, res) => {
   if (!global.lastQR) {
-    return res.send(`
-      <html>
-        <body style="background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column">
-          <h2>No QR yet</h2>
-          <p>Wait 30 seconds and refresh</p>
-        </body>
-      </html>
-    `);
+    return res.send("QR not ready yet");
   }
-  res.send(`
-    <html>
-      <body style="background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0">
-        <h2 style="color:#fff;font-family:sans-serif">Scan with WhatsApp</h2>
-        <img src="${global.lastQR}" style="width:300px;height:300px"/>
-        <p style="color:#888;font-family:sans-serif;font-size:12px;margin-top:20px">Refresh if expired</p>
-      </body>
-    </html>
-  `);
+  const qrImage = await QRCode.toDataURL(global.lastQR);
+  res.send(`<img src="${qrImage}" />`);
 });
 
 // Test route

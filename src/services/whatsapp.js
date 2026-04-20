@@ -828,47 +828,17 @@ async function startSocket() {
 
   sock.ev.on("creds.update", saveCredsHandler);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, qr } = update;
     if (qr) {
-      try {
-        global.lastQR = await QRCode.toDataURL(qr);
-        console.log("QR available at /qr endpoint");
-      } catch (err) {
-        console.error("QR image generation failed:", err.message);
-      }
+      console.log("QR RECEIVED");
+      global.lastQR = qr; // 🔥 CRITICAL
     }
-
-    if (connection === "open") {
-      global.isReady = true;
-      global.lastQR = null;
-      reconnectAttempts = 0;
-      if (!schedulerStarted) {
-        startReminderScheduler(client);
-        schedulerStarted = true;
-        console.log("Reminder scheduler started");
-      }
-      console.log("✅ Nexa is ready ✅");
+    if (connection === 'open') {
+      console.log("Nexa is ready ✅");
     }
-
-    if (connection === "close") {
-      global.isReady = false;
-      const statusCode =
-        lastDisconnect?.error?.output?.statusCode ||
-        lastDisconnect?.error?.data?.statusCode ||
-        null;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
-      console.log("❌ Client disconnected:", statusCode || "unknown");
-
-      if (isLoggedOut) {
-        reconnectDelayMs = 3000;
-        console.log("Session logged out. Waiting for new QR authentication.");
-        scheduleReconnect(1000);
-        return;
-      }
-
-      scheduleReconnect(reconnectDelayMs);
+    if (connection === 'close') {
+      console.log("Connection closed");
     }
   });
 
