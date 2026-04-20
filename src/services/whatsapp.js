@@ -475,7 +475,7 @@ let socket = null;
 let schedulerStarted = false;
 let isInitializing = false;
 let reconnectTimer = null;
-let baileysAuthState = null;
+let state = null;
 let saveCredsHandler = null;
 const sentMessagesCache = new Map();
 const outboundQueue = [];
@@ -819,25 +819,24 @@ async function startSocket() {
   }
 
   const sock = makeWASocket({
-    auth: baileysAuthState,
-    browser: Browsers.macOS("Chrome"),
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 10000
+    auth: state,
+    browser: Browsers.macOS("Desktop")
   });
   socket = sock;
 
   sock.ev.on("creds.update", saveCredsHandler);
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, qr } = update;
+  sock.ev.on('connection.update', (update) => {
+    const { qr, connection } = update;
+    console.log("UPDATE:", update); // 👈 DEBUG (IMPORTANT)
     if (qr) {
       console.log("QR RECEIVED");
-      global.lastQR = qr; // 🔥 CRITICAL
+      global.lastQR = qr;
     }
-    if (connection === 'open') {
+    if (connection === "open") {
       console.log("Nexa is ready ✅");
     }
-    if (connection === 'close') {
+    if (connection === "close") {
       console.log("Connection closed");
     }
   });
@@ -891,8 +890,9 @@ async function initialize() {
 
   try {
     await connectDB();
-    const { state, saveCreds } = await useMultiFileAuthState("auth");
-    baileysAuthState = state;
+    const authState = await useMultiFileAuthState("auth");
+    state = authState.state;
+    const saveCreds = authState.saveCreds;
     saveCredsHandler = saveCreds;
 
     await new Promise((resolve, reject) => {
