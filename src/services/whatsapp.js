@@ -6,7 +6,7 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
 
-const { default: makeWASocket, useMultiFileAuthState, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, Browsers } = require('@whiskeysockets/baileys');
 const { DisconnectReason, downloadMediaMessage } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const QRCode = require("qrcode");
@@ -883,6 +883,53 @@ function bindShutdownHooks() {
   });
 }
 
+async function useMongoAuthState() {
+  const collection = mongoose.connection.db.collection("whatsapp_auth");
+
+  const readData = async (key) => {
+    const doc = await collection.findOne({ _id: key });
+    return doc ? JSON.parse(doc.data) : null;
+  };
+
+  const writeData = async (key, data) => {
+    await collection.updateOne(
+      { _id: key },
+      { $set: { data: JSON.stringify(data) } },
+      { upsert: true }
+    );
+  };
+
+  const creds = await readData("creds") || {};
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            const val = await readData(`${type}-${id}`);
+            if (val) data[id] = val;
+          }
+          return data;
+        },
+        set: async (data) => {
+          for (const [type, typeData] of Object.entries(data)) {
+            for (const [id, value] of Object.entries(typeData || {})) {
+              if (value) await writeData(`${type}-${id}`, value);
+              else await collection.deleteOne({ _id: `${type}-${id}` });
+            }
+          }
+        }
+      }
+    },
+    saveCreds: async (latestCreds) => {
+      await writeData("creds", latestCreds || creds);
+      console.log("✅ SESSION SAVED TO MONGODB");
+    }
+  };
+}
+
 async function initialize() {
   if (isInitializing) return;
   isInitializing = true;
@@ -890,7 +937,7 @@ async function initialize() {
 
   try {
     await connectDB();
-    const authState = await useMultiFileAuthState("auth");
+    const authState = await useMongoAuthState();
     state = authState.state;
     const saveCreds = authState.saveCreds;
     saveCredsHandler = saveCreds;
