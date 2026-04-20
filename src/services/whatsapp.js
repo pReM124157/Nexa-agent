@@ -7,7 +7,7 @@ process.on('uncaughtException', (err) => {
 });
 
 const { default: makeWASocket, Browsers } = require('@whiskeysockets/baileys');
-const { DisconnectReason, downloadMediaMessage } = require("@whiskeysockets/baileys");
+const { DisconnectReason, downloadMediaMessage, initAuthCreds } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const QRCode = require("qrcode");
 const { connectDB, mongoose } = require('../db');
@@ -904,7 +904,7 @@ async function useMongoAuthState() {
     );
   };
 
-  const creds = await readData("creds") || {};
+  const creds = await readData("creds") || initAuthCreds();
 
   return {
     state: {
