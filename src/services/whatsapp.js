@@ -822,8 +822,7 @@ async function startSocket() {
     auth: baileysAuthState,
     browser: Browsers.macOS("Chrome"),
     connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 10000,
-    printQRInTerminal: true
+    keepAliveIntervalMs: 10000
   });
   socket = sock;
 
