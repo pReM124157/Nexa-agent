@@ -804,6 +804,34 @@ function scheduleReconnect(delayMs = 3000) {
   }, nextDelay);
 }
 
+async function clearCorruptedAuthState() {
+  const authPaths = [
+    path.join(__dirname, "../../auth_info_baileys"),
+    path.join(__dirname, "../../.wwebjs_auth")
+  ];
+
+  for (const authPath of authPaths) {
+    try {
+      fs.rmSync(authPath, { recursive: true, force: true });
+      console.log(`Cleared auth path: ${authPath}`);
+    } catch (err) {
+      console.warn(`Failed clearing auth path ${authPath}:`, err.message);
+    }
+  }
+
+  try {
+    if (mongoose.connection.readyState === 1 && mongoose.connection.db) {
+      await mongoose.connection.db.collection("whatsapp_auth").drop();
+      console.log("Cleared MongoDB auth collection: whatsapp_auth");
+    }
+  } catch (err) {
+    // NamespaceNotFound means the collection is already absent.
+    if (err?.codeName !== "NamespaceNotFound") {
+      console.warn("Failed clearing MongoDB auth collection:", err.message);
+    }
+  }
+}
+
 async function startSocket() {
   if (socket) {
     try {
@@ -827,7 +855,7 @@ async function startSocket() {
   sock.ev.on("creds.update", saveCredsHandler);
 
   sock.ev.on('connection.update', async (update) => {
-    const { qr, connection } = update;
+    const { qr, connection, lastDisconnect } = update;
     console.log("UPDATE:", update); // 👈 DEBUG (IMPORTANT)
     if (qr) {
       console.log("QR RECEIVED");
@@ -842,7 +870,31 @@ async function startSocket() {
       console.log("Nexa is ready ✅");
     }
     if (connection === "close") {
-      console.log("Connection closed");
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const reasonText = String(lastDisconnect?.error?.message || "").toLowerCase();
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const isCorruptedAuth =
+        reasonText.includes("public") ||
+        reasonText.includes("invalid credentials") ||
+        reasonText.includes("bad mac");
+
+      console.log("Connection closed", { statusCode, shouldReconnect, isCorruptedAuth });
+
+      if (isCorruptedAuth) {
+        console.log("Corrupted auth detected. Clearing and restarting...");
+        await clearCorruptedAuthState();
+        reconnectAttempts = 0;
+        reconnectDelayMs = 3000;
+        scheduleReconnect(3000);
+        return;
+      }
+
+      if (shouldReconnect) {
+        console.log("Reconnecting...");
+        scheduleReconnect(3000);
+      } else {
+        console.log("Session logged out. Please re-authenticate.");
+      }
     }
   });
 
@@ -891,9 +943,21 @@ function bindShutdownHooks() {
 async function useMongoAuthState() {
   const collection = mongoose.connection.db.collection("whatsapp_auth");
 
+  const fixBuffers = (obj) => {
+    if (!obj || typeof obj !== 'object') return obj;
+    if (obj.type === 'Buffer' && Array.isArray(obj.data)) {
+      return Buffer.from(obj.data);
+    }
+    for (const key of Object.keys(obj)) {
+      obj[key] = fixBuffers(obj[key]);
+    }
+    return obj;
+  };
+
   const readData = async (key) => {
     const doc = await collection.findOne({ _id: key });
-    return doc ? JSON.parse(doc.data) : null;
+    if (!doc) return null;
+    return fixBuffers(JSON.parse(doc.data));
   };
 
   const writeData = async (key, data) => {
@@ -928,8 +992,8 @@ async function useMongoAuthState() {
         }
       }
     },
-    saveCreds: async (latestCreds) => {
-      await writeData("creds", latestCreds || creds);
+    saveCreds: async () => {
+      await writeData("creds", creds);
       console.log("✅ SESSION SAVED TO MONGODB");
     }
   };
